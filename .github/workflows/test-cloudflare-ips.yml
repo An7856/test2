@@ -1,4 +1,4 @@
-name: Cloudflare 代理IP测试
+name: Cloudflare代理IP自动化测试
 
 on:
   workflow_dispatch:
@@ -6,7 +6,7 @@ on:
     - cron: '0 0 * * *'  # 每天UTC时间0点自动运行
 
 jobs:
-  test-ips:
+  cf-ip-tester:
     runs-on: ubuntu-latest
     steps:
     - name: 检出代码
@@ -20,131 +20,158 @@ jobs:
     - name: 安装依赖
       run: |
         python -m pip install --upgrade pip
-        pip install requests numpy speedtest-cli ipaddress
+        pip install requests numpy ipaddress
 
     - name: 创建输出目录
-      run: mkdir -p ./results
+      run: mkdir -p ./test_results
 
-    - name: 运行Cloudflare IP测试
+    - name: 运行IP测试并生成报告
       run: |
-        cat << 'EOF' > cloudflare_tester.py
+        cat << 'EOF' > cf_ip_tester.py
         import requests
         import time
-        import concurrent.futures
-        import json
-        import os
-        import ipaddress
         import random
+        import ipaddress
+        import json
         from datetime import datetime
+        from concurrent.futures import ThreadPoolExecutor, as_completed
 
         # 配置参数
         CLOUDFLARE_IP_RANGES = [
-            "173.245.48.0/20",
-            "103.21.244.0/22",
-            "103.22.200.0/22",
-            "103.31.4.0/22",
-            "141.101.64.0/18",
-            "108.162.192.0/18",
-            "190.93.240.0/20",
-            "188.114.96.0/20",
-            "197.234.240.0/22",
-            "198.41.128.0/17",
-            "162.158.0.0/15",
-            "104.16.0.0/13",
-            "104.24.0.0/14",
-            "172.64.0.0/13",
-            "131.0.72.0/22"
+            "173.245.48.0/20", "103.21.244.0/22", "103.22.200.0/22",
+            "103.31.4.0/22", "141.101.64.0/18", "108.162.192.0/18"
         ]
-        IPS_PER_RANGE = 5
-        MAX_WORKERS = 20
-        TEST_FILE_URL = "https://speed.cloudflare.com/__down?bytes=1000000"
+        TEST_IPS_PER_RANGE = 3  # 每个范围测试3个IP
+        MAX_WORKERS = 10        # 并发线程数
+        TIMEOUT = 5             # 超时时间(秒)
 
-        # 确保输出目录存在
-        output_dir = os.path.join(os.getcwd(), "results")
-        os.makedirs(output_dir, exist_ok=True)
-
-        def generate_random_ip(ip_range):
-            network = ipaddress.ip_network(ip_range)
-            network_int = int.from_bytes(network.network_address.packed, "big")
-            mask = (1 << (32 - network.prefixlen)) - 1
-            rand_ip_int = network_int | random.randint(0, mask)
-            return str(ipaddress.IPv4Address(rand_ip_int))
+        def generate_test_ips():
+            """从Cloudflare范围生成随机测试IP"""
+            test_ips = []
+            for ip_range in CLOUDFLARE_IP_RANGES:
+                network = ipaddress.ip_network(ip_range)
+                for _ in range(TEST_IPS_PER_RANGE):
+                    network_int = int.from_bytes(network.network_address.packed, "big")
+                    rand_ip = network_int + random.getrandbits(32 - network.prefixlen)
+                    test_ips.append(str(ipaddress.IPv4Address(rand_ip)))
+            return test_ips
 
         def test_ip(ip):
-            # 测试逻辑保持不变
-            # ...
-            # 返回测试结果字典
-            return {
-                "ip": ip,
-                "latency": 10.5,  # 示例值
-                "download_speed": 1024.0,  # 示例值
-                "country": "China",
-                "region": "Beijing",
-                "city": "Beijing",
-                "isp": "Cloudflare"
-            }
+            """测试单个IP的延迟和可用性"""
+            try:
+                start = time.time()
+                r = requests.get(
+                    f"http://{ip}",
+                    headers={"Host": "www.cloudflare.com"},
+                    timeout=TIMEOUT,
+                    allow_redirects=False
+                )
+                latency = (time.time() - start) * 1000  # 毫秒
+                return {
+                    "ip": ip,
+                    "latency": round(latency, 2),
+                    "status": "OK" if r.status_code in [301, 302, 307, 308] else "Fail",
+                    "tested_at": datetime.now().isoformat()
+                }
+            except Exception as e:
+                return {
+                    "ip": ip,
+                    "latency": 9999,
+                    "status": f"Error: {str(e)}",
+                    "tested_at": datetime.now().isoformat()
+                }
 
-        def main():
-            print(f"开始测试，时间: {datetime.now().isoformat()}")
-            
-            # 生成测试IP列表
-            test_ips = [generate_random_ip(ip_range) for ip_range in CLOUDFLARE_IP_RANGES for _ in range(IPS_PER_RANGE)]
-            print(f"已生成 {len(test_ips)} 个测试IP")
-
-            # 测试IP (示例简化版)
-            results = [test_ip(ip) for ip in test_ips[:10]]  # 只测试前10个作为演示
-
-            # 准备输出内容
-            output_lines = [
-                "Cloudflare最优代理IP列表",
-                f"生成时间: {datetime.now().isoformat()}",
-                "="*50
+        def generate_report(results):
+            """生成TXT格式测试报告"""
+            report = [
+                "="*70,
+                f"Cloudflare代理IP测试报告".center(60),
+                f"生成时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+                "="*70,
+                "序号   IP地址          延迟(ms)  状态",
+                "-"*70
             ]
             
-            for i, result in enumerate(results, 1):
-                output_lines.append(
-                    f"{i}. IP: {result['ip']}\n"
-                    f"   延迟: {result['latency']}ms | "
-                    f"速度: {result['download_speed']}KB/s\n"
-                    f"   位置: {result['city']}, {result['region']}, {result['country']}\n"
-                    f"   ISP: {result['isp']}\n"
+            # 按延迟排序并过滤成功结果
+            working_ips = [r for r in results if r['status'] == 'OK']
+            sorted_ips = sorted(working_ips, key=lambda x: x['latency'])
+            
+            for idx, result in enumerate(sorted_ips[:20], 1):  # 只显示前20个
+                report.append(
+                    f"{idx:<6} {result['ip']:<15} {result['latency']:>8.2f}   {result['status']}"
                 )
+            
+            report.extend([
+                "-"*70,
+                f"总测试IP: {len(results)} 个",
+                f"有效IP: {len(working_ips)} 个",
+                f"平均延迟: {sum(r['latency'] for r in working_ips)/len(working_ips):.2f} ms" if working_ips else "无有效IP",
+                "="*70
+            ])
+            return "\n".join(report)
 
-            # 写入文件
-            txt_path = os.path.join(output_dir, "best_ips.txt")
-            json_path = os.path.join(output_dir, "full_results.json")
+        def save_results(data, report):
+            """保存测试结果"""
+            os.makedirs("./test_results", exist_ok=True)
             
-            with open(txt_path, "w", encoding="utf-8") as f:
-                f.write("\n".join(output_lines))
+            # 保存TXT报告
+            with open("./test_results/cf_ip_report.txt", "w", encoding="utf-8") as f:
+                f.write(report)
             
-            with open(json_path, "w", encoding="utf-8") as f:
-                json.dump({"results": results, "generated_at": datetime.now().isoformat()}, f, indent=2)
+            # 保存原始JSON数据
+            with open("./test_results/cf_ip_data.json", "w", encoding="utf-8") as f:
+                json.dump({
+                    "metadata": {
+                        "generated_at": datetime.now().isoformat(),
+                        "total_tested": len(data)
+                    },
+                    "results": data
+                }, f, indent=2, ensure_ascii=False)
+
+        def main():
+            print("🟢 开始Cloudflare代理IP测试")
+            test_ips = generate_test_ips()
+            print(f"🔍 共生成 {len(test_ips)} 个测试IP")
+
+            print("⚡ 开始并发测试...")
+            results = []
+            with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+                futures = {executor.submit(test_ip, ip): ip for ip in test_ips}
+                for future in as_completed(futures):
+                    results.append(future.result())
+                    print(f"测试完成: {future.result()['ip']} ({future.result()['status']})")
+
+            print("📊 生成测试报告...")
+            report = generate_report(results)
+            save_results(results, report)
             
-            print(f"结果已保存到: {txt_path} 和 {json_path}")
+            print("\n🔷 测试报告预览:")
+            print(report[:300] + "...\n")
+            print("✅ 测试完成！结果已保存到 ./test_results/ 目录")
 
         if __name__ == "__main__":
-            try:
-                main()
-            except Exception as e:
-                print(f"执行出错: {str(e)}")
-                exit(1)
+            import os
+            main()
         EOF
 
-        python cloudflare_tester.py
+        python cf_ip_tester.py
 
-    - name: 验证结果文件
+    - name: 验证生成文件
       run: |
-        echo "当前目录结构:"
-        ls -R
-        echo "结果文件内容:"
-        cat ./results/best_ips.txt || echo "无法读取结果文件"
-        echo "JSON文件大小:"
-        stat -c "%n %s bytes" ./results/full_results.json || echo "无法读取JSON文件"
+        echo "📂 目录结构:"
+        ls -lh ./test_results/
+        echo "\n📝 报告预览:"
+        head -n 15 ./test_results/cf_ip_report.txt
+        echo "\n📊 JSON数据统计:"
+        jq '.metadata + {working_ips: (.results | map(select(.status=="OK") | length)}' ./test_results/cf_ip_data.json
 
     - name: 上传测试结果
       uses: actions/upload-artifact@v4
       with:
-        name: cloudflare-ip-results
-        path: ./results/
+        name: cloudflare-ip-test-results
+        path: |
+          ./test_results/cf_ip_report.txt
+          ./test_results/cf_ip_data.json
         if-no-files-found: error
-        retention-days: 5
+        retention-days: 7
+      timeout-minutes: 5
