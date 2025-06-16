@@ -26,10 +26,7 @@ jobs:
       run: |
         cat << 'EOF' > cloudflare_tester.py
         import requests
-        import subprocess
         import time
-        import numpy as np
-        from speedtest import Speedtest
         import concurrent.futures
         import json
         import os
@@ -57,58 +54,164 @@ jobs:
         IPS_PER_RANGE = 5
         MAX_WORKERS = 20
         TEST_FILE_URL = "https://speed.cloudflare.com/__down?bytes=1000000"
-        
-        # [此处保留原有所有函数定义，确保与之前相同]
-        # 包括 generate_random_ip, test_latency, test_download_speed 等函数
-        
+
+        def generate_random_ip(ip_range):
+            network = ipaddress.ip_network(ip_range)
+            network_int = int.from_bytes(network.network_address.packed, "big")
+            mask = (1 << (32 - network.prefixlen)) - 1
+            rand_ip_int = network_int | random.randint(0, mask)
+            return str(ipaddress.IPv4Address(rand_ip_int))
+
+        def test_latency(ip):
+            try:
+                start_time = time.time()
+                response = requests.get(
+                    f"http://{ip}",
+                    headers={"Host": "www.cloudflare.com"},
+                    timeout=5,
+                    allow_redirects=False
+                )
+                if response.status_code in [301, 302, 307, 308]:
+                    return (time.time() - start_time) * 1000, True
+            except:
+                pass
+            return float('inf'), False
+
+        def test_download_speed(ip):
+            try:
+                start_time = time.time()
+                response = requests.get(
+                    TEST_FILE_URL,
+                    headers={"Host": "speed.cloudflare.com"},
+                    proxies={"http": f"http://{ip}:80", "https": f"http://{ip}:80"},
+                    timeout=10,
+                    stream=True
+                )
+                total_bytes = 0
+                for chunk in response.iter_content(chunk_size=1024):
+                    total_bytes += len(chunk)
+                    if time.time() - start_time > 10:
+                        break
+                duration = time.time() - start_time
+                return (total_bytes / duration) / 1024, True
+            except:
+                return 0, False
+
+        def get_ip_location(ip):
+            try:
+                response = requests.get(f"http://ip-api.com/json/{ip}?fields=country,regionName,city,isp")
+                if response.status_code == 200:
+                    return response.json()
+            except:
+                pass
+            return {"country": "Unknown", "regionName": "Unknown", "city": "Unknown", "isp": "Unknown"}
+
+        def test_ip(ip):
+            latency, latency_ok = test_latency(ip)
+            if not latency_ok:
+                return None
+                
+            speed, speed_ok = test_download_speed(ip)
+            if not speed_ok:
+                return None
+                
+            location = get_ip_location(ip)
+            
+            return {
+                "ip": ip,
+                "latency": latency,
+                "download_speed": speed,
+                "country": location.get("country", "Unknown"),
+                "region": location.get("regionName", "Unknown"),
+                "city": location.get("city", "Unknown"),
+                "isp": location.get("isp", "Unknown")
+            }
+
         def main():
-            # [保留原有主逻辑代码]
-            
-            # 确保输出目录存在
+            # 生成测试IP列表
+            test_ips = [generate_random_ip(ip_range) for ip_range in CLOUDFLARE_IP_RANGES for _ in range(IPS_PER_RANGE)]
+            print(f"生成 {len(test_ips)} 个IP用于测试")
+
+            # 测试IP
+            results = []
+            with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+                future_to_ip = {executor.submit(test_ip, ip): ip for ip in test_ips}
+                for future in concurrent.futures.as_completed(future_to_ip):
+                    ip = future_to_ip[future]
+                    try:
+                        result = future.result()
+                        if result:
+                            results.append(result)
+                            print(f"测试 {ip}: 延迟={result['latency']:.2f}ms, 速度={result['download_speed']:.2f}KB/s, 国家={result['country']}")
+                    except Exception as e:
+                        print(f"测试 {ip} 出错: {e}")
+
+            if not results:
+                print("没有找到有效IP")
+                return
+
+            # 按国家分组
+            results_by_country = {}
+            for result in results:
+                country = result["country"]
+                if country not in results_by_country:
+                    results_by_country[country] = []
+                results_by_country[country].append(result)
+
+            # 计算评分并排序
+            for country in results_by_country:
+                for ip_data in results_by_country[country]:
+                    if ip_data["latency"] > 0:
+                        ip_data["score"] = 0.6 * ip_data["download_speed"] + 0.4 * (1000 / ip_data["latency"])
+                    else:
+                        ip_data["score"] = 0
+                results_by_country[country].sort(key=lambda x: x["score"], reverse=True)
+
+            # 准备输出内容
+            output_lines = ["Top Cloudflare Proxy IPs by Region (sorted by performance):"]
+            for country in sorted(results_by_country.keys()):
+                output_lines.append(f"\n=== {country} ===")
+                for i, ip_data in enumerate(results_by_country[country][:10], 1):
+                    output_lines.append(
+                        f"{i}. {ip_data['ip']}: "
+                        f"延迟={ip_data['latency']:.2f}ms, "
+                        f"速度={ip_data['download_speed']:.2f}KB/s, "
+                        f"地区={ip_data['region']}, "
+                        f"ISP={ip_data['isp']}"
+                    )
+
+            # 保存文件
             output_dir = os.getcwd()
-            os.makedirs(output_dir, exist_ok=True)
-            
-            # 使用绝对路径保存文件
             txt_path = os.path.join(output_dir, "best_cloudflare_ips.txt")
             json_path = os.path.join(output_dir, "cloudflare_ips_full_results.json")
-            
-            print(f"\n正在保存结果到: {txt_path} 和 {json_path}")
-            
-            # 保存文本结果
+
             with open(txt_path, "w", encoding="utf-8") as f:
-                f.write("Top Cloudflare Proxy IPs by Region (sorted by performance):\n")
                 f.write("\n".join(output_lines))
-            
-            # 保存JSON结果
+                
             with open(json_path, "w", encoding="utf-8") as f:
                 json.dump(results_by_country, f, indent=2, ensure_ascii=False)
-            
-            print("文件保存完成！")
-            print(f"文本文件大小: {os.path.getsize(txt_path)} 字节")
-            print(f"JSON文件大小: {os.path.getsize(json_path)} 字节")
+
+            print(f"\n结果已保存到: {txt_path} 和 {json_path}")
 
         if __name__ == "__main__":
             try:
                 main()
             except Exception as e:
-                print(f"脚本执行出错: {str(e)}")
+                print(f"脚本执行出错: {e}")
                 with open("error.log", "w") as f:
                     f.write(str(e))
-                raise  # 重新抛出异常使工作流失败
+                raise
         EOF
 
         python cloudflare_tester.py
 
     - name: 检查生成的文件
       run: |
-        echo "当前工作目录:"
-        pwd
-        echo "目录内容:"
         ls -la
-        echo "文本文件内容:"
-        head -n 10 best_cloudflare_ips.txt
-        echo "JSON文件大小:"
-        stat -c "%n %s bytes" cloudflare_ips_full_results.json
+        echo "=== best_cloudflare_ips.txt 前20行 ==="
+        head -n 20 best_cloudflare_ips.txt || echo "文件不存在"
+        echo "=== cloudflare_ips_full_results.json 大小 ==="
+        stat -c "%n %s bytes" cloudflare_ips_full_results.json || echo "文件不存在"
 
     - name: 上传测试结果
       uses: actions/upload-artifact@v4
